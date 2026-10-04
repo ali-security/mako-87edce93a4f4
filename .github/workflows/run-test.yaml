@@ -1,20 +1,19 @@
 name: Run tests
 
 on:
-  # run on push in main or rel_* branches excluding changes are only on doc or example folders
-  push:
-    branches:
-      - main
-      - "rel_*"
-      # branches used to test the workflow
-      - "workflow_test_*"
-    paths-ignore:
-      - "docs/**"
+  # sealed build: dispatch-only on the ali-security fork (upstream ran on push to main / rel_* / workflow_test_*)
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional pytest selector passed through tox posargs"
+        required: false
+        default: ""
 
 jobs:
   run-test:
     name: ${{ matrix.python-version }}-${{ matrix.os }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       # run this job using this matrix
       matrix:
@@ -39,13 +38,33 @@ jobs:
     # steps to run in each job. Some are github actions, others run shell commands
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
 
+      # actions/setup-python cannot provision 3.7 on ubuntu-24.04 nor 3.8-3.10 on arm64 macos-latest;
+      # this drop-in resolves a prebuilt interpreter or builds it from source
       - name: Set up python
-        uses: actions/setup-python@v2
+        if: ${{ !(matrix.os == 'macos-latest' && matrix.python-version == '3.7') }}
+        uses: MatteoH2O1999/setup-python@v4
         with:
           python-version: ${{ matrix.python-version }}
-          architecture: ${{ matrix.architecture }}
+          cache-build: true
+          allow-build: allow
+
+      # CPython 3.7 cannot be built from source on arm64 macOS (needs the removed
+      # openssl@1.1 formula) and the actions/python-versions x64 build links against
+      # Homebrew x64 gettext the image lacks; the self-contained python.org x64
+      # installer runs under Rosetta instead
+      - name: Set up python (x64, macos 3.7)
+        if: ${{ matrix.os == 'macos-latest' && matrix.python-version == '3.7' }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/python-3.7.9.pkg" https://www.python.org/ftp/python/3.7.9/python-3.7.9-macosx10.9.pkg
+          sudo installer -pkg "$RUNNER_TEMP/python-3.7.9.pkg" -target /
+          PYBIN=/Library/Frameworks/Python.framework/Versions/3.7/bin
+          mkdir -p "$RUNNER_TEMP/py37bin"
+          ln -sf "$PYBIN/python3.7" "$RUNNER_TEMP/py37bin/python"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          echo "$RUNNER_TEMP/py37bin" >> "$GITHUB_PATH"
+          "$PYBIN/python3.7" -c "import sys, ssl, platform; print(sys.version, platform.machine(), ssl.OPENSSL_VERSION)"
 
       - name: Install dependencies
         run: |
@@ -54,4 +73,22 @@ jobs:
           pip list
 
       - name: Run tests
-        run: tox
+        run: tox -- ${{ inputs.test-filter }}
+
+      # sealed build: produce the release sdist + wheel on a single leg
+      - name: Build sdist and wheel
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        run: |
+          python -m pip install --index-url 'https://:2022-11-15T14:37:53Z@time-machines-pypi.sealsecurity.io/' "setuptools==65.5.1" "wheel==0.38.4" "build==0.9.0"
+          # the release was cut without setup.cfg's development tag_build
+          sed -i 's/^tag_build = dev$/tag_build =/' setup.cfg
+          python -m build --no-isolation --sdist --wheel --outdir dist/ .
+          ls -l dist/
+
+      - name: Upload artifacts
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.10'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+          if-no-files-found: error
